@@ -1,0 +1,41 @@
+# --- Core data / scientific stack ---
+pandas
+numpy
+pyarrow
+
+# --- NLP / text processing ---
+spacy
+langdetect
+beautifulsoup4
+ftfy
+unidecode
+
+# --- Embeddings & vector DB ---
+sentence-transformers
+chromadb
+torch
+
+# --- Topic modeling / sentiment (used from Week 3 onward, pinned now) ---
+bertopic
+nltk
+vaderSentiment
+
+# --- LLM API integration (DeepSeek via OpenRouter) ---
+openai          # OpenRouter is OpenAI-API-compatible
+python-dotenv
+tenacity
+
+# --- Data acquisition ---
+arxiv
+wikipedia-api
+praw             # optional, only if using Reddit as source
+
+# --- API layer (used from later weeks, pinned now) ---
+fastapi
+uvicorn
+pydantic
+
+# --- Dev / testing ---
+pytest
+pytest-cov
+tqdm
