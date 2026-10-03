@@ -21,14 +21,15 @@ nltk
 vaderSentiment
 
 # --- LLM API integration (DeepSeek via OpenRouter) ---
-openai          # OpenRouter is OpenAI-API-compatible
+openai          # OpenAI SDK kept for reference/alt integration path
+httpx             # direct HTTP client used by src/generation.py
 python-dotenv
 tenacity
 
 # --- Data acquisition ---
 arxiv
 wikipedia-api
-praw             # optional, only if using Reddit as source
+praw               # optional, only if using Reddit as source
 
 # --- API layer (used from later weeks, pinned now) ---
 fastapi
@@ -38,4 +39,5 @@ pydantic
 # --- Dev / testing ---
 pytest
 pytest-cov
+pytest-httpx
 tqdm

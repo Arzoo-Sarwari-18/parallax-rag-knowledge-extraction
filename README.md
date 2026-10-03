@@ -25,17 +25,23 @@ parallax-rag-system/
 │   ├── acquire_data.py          # pulls 5,000+ raw docs (ArXiv/Wikipedia/Reddit)
 │   ├── build_clean_corpus.py    # runs data/raw/*.jsonl through preprocessing.py
 │   ├── ingest_to_chromadb.py    # chunk -> embed -> ingest into ChromaDB
-│   └── benchmark_retrieval.py   # measures retrieval latency across test queries
+│   ├── benchmark_retrieval.py   # measures retrieval latency across test queries
+│   └── rag_query.py             # end-to-end: retrieve -> generate -> hallucination check
 ├── src/
-│   ├── preprocessing.py  # modular text-cleaning functions
-│   ├── chunking.py       # recursive text chunking
-│   ├── embeddings.py     # sentence-transformers wrapper with perf logging
-│   └── vector_store.py   # ChromaDB wrapper: ingestion + semantic search
+│   ├── preprocessing.py        # modular text-cleaning functions
+│   ├── chunking.py             # recursive text chunking
+│   ├── embeddings.py           # sentence-transformers wrapper with perf logging
+│   ├── vector_store.py         # ChromaDB wrapper: ingestion + semantic search
+│   ├── generation.py           # LLM answer generation (OpenRouter/DeepSeek)
+│   └── hallucination_check.py  # heuristic groundedness check on generated answers
 ├── tests/
 │   ├── test_preprocessing.py
 │   ├── test_chunking.py
 │   ├── test_embeddings.py
-│   └── test_vector_store.py
+│   ├── test_vector_store.py
+│   ├── test_generation.py
+│   ├── test_hallucination_check.py
+│   └── test_rag_query.py
 ├── .env.example
 ├── .gitignore
 ├── pytest.ini
@@ -315,5 +321,152 @@ this week's work.
   integration`) — run it locally once you have network access.
 - Retrieval quality (as opposed to latency) isn't evaluated yet —
   Precision@K/Recall@K land in Week 5 once a labeled test set exists.
-- Week 3 will add LLM generation grounded in the chunks retrieved
-  here.
+- Week 3 adds LLM generation grounded in the chunks retrieved here —
+  see below.
+
+---
+
+## Week 3 (Sep 28 – Oct 4): LLM Integration & Prompt Engineering
+
+### What I built
+
+- **`src/generation.py`**: calls an OpenRouter-compatible
+  `/chat/completions` endpoint (works with DeepSeek's own API too —
+  just change `OPENROUTER_BASE_URL`/`LLM_MODEL` in `.env`) via `httpx`
+  directly rather than the `openai` SDK, so retry/error handling is
+  explicit and fully controlled rather than hidden behind SDK defaults.
+  - **System prompt**: instructs the model to answer *only* from the
+    numbered source excerpts, cite every claim inline (`[1]`, `[2][3]`),
+    say a fixed, detectable phrase when the sources don't cover the
+    question, and decline off-topic questions rather than answering
+    from general knowledge.
+  - **Context injection**: `build_context_block` numbers each
+    retrieved chunk with its source/doc-id tag so citations are
+    traceable back to a specific chunk, not just "the sources" in the
+    abstract.
+  - **Error handling**: typed `GenerationError` with an
+    `error_type` enum (`auth_error`, `rate_limit`, `timeout`,
+    `context_length_exceeded`, `server_error`, `unknown`) so a caller
+    (CLI now, FastAPI in Week 5) can map failures to the right
+    response without parsing exception text. 401 fails immediately
+    (no point retrying bad credentials); 429 respects a `Retry-After`
+    header when present, else exponential backoff, up to
+    `max_retries`; 5xx retries the same way; a context-length 400 is
+    surfaced as its own typed error rather than a generic failure;
+    network timeouts retry then raise a typed `TIMEOUT` error.
+- **`src/hallucination_check.py`**: two dependency-free heuristics run
+  on every generated answer — (1) does the answer cite any source at
+  all despite sources being available (a model answering from its own
+  knowledge instead of the context typically cites nothing), and (2)
+  Jaccard lexical overlap between the answer's vocabulary and the
+  cited sources' vocabulary (low overlap is a proxy for drift from
+  what the context actually says). Returns a verdict
+  (`grounded`/`low_overlap`/`no_citations`/`out_of_domain`/`no_sources`)
+  plus human-readable flags — explicitly *not* a claim-by-claim fact
+  checker (that needs a second LLM call or an NLI model), just a cheap
+  first-line signal for a human or a more expensive check to act on.
+- **Out-of-domain handling, two layers deep**:
+  1. **Retrieval-side** (`scripts/rag_query.py`'s
+     `filter_relevant_sources`): chunks with cosine distance above
+     `--max-distance` (default `0.8`) are dropped *before* the LLM
+     ever sees them — a query with no genuinely relevant chunks
+     shouldn't pay for a generation call likely to hallucinate from
+     weakly-related context.
+  2. **Generation-side**: the system prompt instructs an explicit
+     refusal phrase for off-topic/insufficient-context questions;
+     `generation.py` detects that phrase and flags
+     `is_out_of_domain=True`; empty sources (either from retrieval or
+     from being fully filtered out) short-circuit to a canned
+     out-of-domain response with **zero API calls** — free, and
+     removes any chance of the model hallucinating on empty context.
+- **`scripts/rag_query.py`**: the full pipeline —
+  embed question → retrieve top-k → drop irrelevant chunks → generate
+  → hallucination check → print answer with citations. Every stage's
+  latency (embed / retrieval / generation / total) is measured and
+  logged, along with the hallucination verdict and token counts, to
+  `logs/query_log.jsonl` (one line per query — this log is what
+  Week 5's automated evaluation script will read).
+- **Tests** (37 new, 108 total across the repo, 1 skipped by design):
+  `tests/test_generation.py` (14 — uses `pytest-httpx` to mock the
+  actual HTTP layer, not the `LLMGenerator` methods, so the real
+  request/retry/error-parsing code runs in tests, including a fixture
+  that stubs `time.sleep` so retry-backoff tests run instantly instead
+  of actually waiting), `tests/test_hallucination_check.py` (13 — pure
+  logic, no mocking needed), and `tests/test_rag_query.py` (6 — the
+  distance-based relevance filter, including the boundary case where a
+  result exactly at the threshold is kept, not dropped).
+
+### How I approached prompt engineering
+
+The system prompt's five rules map directly onto the week's two hard
+requirements (hallucination resistance, out-of-domain handling) rather
+than being generic "be helpful" boilerplate: rule 1 forbids outside
+knowledge even when the model is "confident"; rule 2 forces inline
+citations, which is what makes the no-citations hallucination check
+possible; rule 3 gives a single fixed refusal phrase (not "however you
+like") specifically so `_looks_out_of_domain` can detect it
+reliably — a model free to phrase its refusal however it wants would
+make that string match unreliable. Context injection numbers sources
+rather than concatenating them, because numbered citations are the
+mechanism both the model's refusal behavior and the hallucination
+check depend on.
+
+### Error handling philosophy
+
+Every failure mode is either retried with backoff (rate limits, 5xx,
+timeouts — transient, likely to succeed on retry) or fails fast with a
+typed, specific error (bad auth, context-length-exceeded — retrying
+won't help, so don't waste the retry budget or the user's time). No
+bare `except Exception` anywhere in the retry loop — every path is a
+named `GenerationErrorType` a caller can branch on.
+
+### How to run it
+
+```bash
+# 1. Run the new unit tests (no API key or network needed — HTTP is mocked)
+pytest tests/test_generation.py tests/test_hallucination_check.py tests/test_rag_query.py -v
+
+# 2. Add your OpenRouter key to .env (see .env.example)
+cp .env.example .env   # then fill in OPENROUTER_API_KEY
+
+# 3. Make sure the vector DB is populated (Week 2)
+python scripts/ingest_to_chromadb.py
+
+# 4. Ask a question end-to-end
+python scripts/rag_query.py "What is retrieval-augmented generation?"
+python scripts/rag_query.py "What's the capital of France?" --top-k 3
+# -> the second one should trigger the out-of-domain path if your
+#    corpus doesn't cover geography
+
+# Every query's latency + hallucination verdict is appended to
+# logs/query_log.jsonl
+```
+
+### Dependencies added this week
+
+`httpx` (direct HTTP client for `generation.py`), `pytest-httpx` (mocks
+`httpx` at the transport layer for tests), `python-dotenv` (loads
+`.env`). `openai` and `tenacity` were pinned in Week 1 in anticipation
+of this week but `generation.py` ended up using `httpx` directly for
+full control over the retry/error-typing logic described above.
+
+### Known limitations / next steps
+
+- No live OpenRouter/DeepSeek calls have been made in this environment
+  (no network access to `openrouter.ai` here) — every code path
+  (success, 401, 429 with and without `Retry-After`, 5xx, context-length
+  400, timeout, malformed 4xx) is exercised against a mocked HTTP
+  transport instead. Run `python scripts/rag_query.py "..."` locally
+  with a real `OPENROUTER_API_KEY` to validate against the live API.
+- The hallucination check is intentionally a cheap heuristic
+  (citation presence + lexical overlap), not semantic fact-checking —
+  it will miss a fluent answer that cites correctly but subtly
+  misstates what a source says. A model-graded or NLI-based check is
+  a natural Week 5 evaluation extension if the heuristic proves too
+  coarse.
+- The `--max-distance=0.8` out-of-domain threshold is a reasonable
+  starting point for `all-MiniLM-L6-v2`, not yet empirically tuned —
+  Week 5's Precision@K/Recall@K evaluation against a labeled set is
+  the planned place to calibrate it.
+- Week 4 will add topic modeling and sentiment analysis, and fold that
+  metadata into the vector DB for filtered retrieval.
