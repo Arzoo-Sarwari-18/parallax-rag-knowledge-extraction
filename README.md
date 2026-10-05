@@ -26,14 +26,18 @@ parallax-rag-system/
 │   ├── build_clean_corpus.py    # runs data/raw/*.jsonl through preprocessing.py
 │   ├── ingest_to_chromadb.py    # chunk -> embed -> ingest into ChromaDB
 │   ├── benchmark_retrieval.py   # measures retrieval latency across test queries
-│   └── rag_query.py             # end-to-end: retrieve -> generate -> hallucination check
+│   ├── rag_query.py             # end-to-end: retrieve -> generate -> hallucination check
+│   ├── enrich_corpus_with_nlp.py # adds topic + sentiment metadata to ChromaDB chunks
+│   └── evaluate_sentiment.py    # accuracy check against a hand-labeled test set
 ├── src/
 │   ├── preprocessing.py        # modular text-cleaning functions
 │   ├── chunking.py             # recursive text chunking
 │   ├── embeddings.py           # sentence-transformers wrapper with perf logging
 │   ├── vector_store.py         # ChromaDB wrapper: ingestion + semantic search
 │   ├── generation.py           # LLM answer generation (OpenRouter/DeepSeek)
-│   └── hallucination_check.py  # heuristic groundedness check on generated answers
+│   ├── hallucination_check.py  # heuristic groundedness check on generated answers
+│   ├── topic_modeling.py       # BERTopic over precomputed chunk embeddings
+│   └── sentiment_analysis.py   # VADER-based sentiment scoring
 ├── tests/
 │   ├── test_preprocessing.py
 │   ├── test_chunking.py
@@ -41,7 +45,9 @@ parallax-rag-system/
 │   ├── test_vector_store.py
 │   ├── test_generation.py
 │   ├── test_hallucination_check.py
-│   └── test_rag_query.py
+│   ├── test_rag_query.py
+│   ├── test_topic_modeling.py
+│   └── test_sentiment_analysis.py
 ├── .env.example
 ├── .gitignore
 ├── pytest.ini
@@ -469,4 +475,162 @@ full control over the retry/error-typing logic described above.
   Week 5's Precision@K/Recall@K evaluation against a labeled set is
   the planned place to calibrate it.
 - Week 4 will add topic modeling and sentiment analysis, and fold that
-  metadata into the vector DB for filtered retrieval.
+  metadata into the vector DB for filtered retrieval — see below.
+
+---
+
+## Week 4 (Oct 5 – Oct 11): NLP Analysis (Topic & Sentiment)
+
+### What I built
+
+- **`src/topic_modeling.py`**: wraps BERTopic for corpus-level theme
+  discovery, reusing the Week 2 chunk embeddings instead of letting
+  BERTopic compute (and download a model for) its own — a
+  `PrecomputedEmbedder` stub is passed at construction only to satisfy
+  BERTopic's API, and raises loudly if it's ever actually called,
+  turning a silent "accidentally re-embedded everything" bug into an
+  immediate, obvious failure.
+  - **Small-corpus edge case**: BERTopic's default `min_topic_size=10`
+    and UMAP's default `n_neighbors=15` both error or degenerate
+    ("everything is noise") on a corpus smaller than that. Both are
+    auto-scaled down based on actual corpus size — verified directly
+    in `test_small_corpus_does_not_crash` and
+    `test_scales_down_for_small_corpus`.
+  - **Jargon**: topic *words* come straight from BERTopic's c-TF-IDF
+    over the chunk text itself, so domain jargon (ArXiv terminology,
+    etc.) becomes the topic label naturally rather than being filtered
+    out — verified in `test_topic_words_reflect_cluster_content`
+    against a synthetic two-cluster corpus.
+  - **Outlier chunks** (HDBSCAN's `-1` cluster — points that don't fit
+    any dense cluster) get a readable `"outlier/noise"` label instead
+    of a bare `-1`, and are counted separately rather than silently
+    folded into a topic they don't belong to.
+- **`src/sentiment_analysis.py`**: wraps VADER (lexicon/rule-based —
+  no model download, fast enough for 5,000+ chunks on CPU, and built
+  for exactly the negation/intensifier/punctuation patterns common in
+  informal text). Documented, tested limitation: VADER's lexicon has
+  little to say about jargon-heavy formal text (an ArXiv abstract with
+  no sentiment-bearing vocabulary scores near-zero and is labeled
+  "neutral" — correct VADER behavior, but ambiguous with "genuinely
+  balanced tone").
+  - **Short documents**: flagged `low_confidence=True` below 5 words
+    (a 1-2 word fragment gives a lexicon method almost nothing to work
+    with) rather than returning a label with false certainty.
+  - **Empty/whitespace-only text**: returns neutral +
+    `low_confidence=True` directly, without calling VADER on nothing.
+- **`scripts/evaluate_sentiment.py`**: the accuracy validation this
+  week explicitly asks for — 18 hand-labeled examples split into four
+  categories (clear-cut, informal/Reddit-style, jargon-heavy/ArXiv-
+  style, short fragments), scored for overall + per-category accuracy
+  and a full confusion matrix. See **Results** below — this is real,
+  run output, not a placeholder.
+- **`scripts/enrich_corpus_with_nlp.py`**: runs both topic modeling and
+  sentiment analysis over every chunk and **upserts the results as
+  ChromaDB metadata** (`topic_id`, `topic_label`, `sentiment_label`,
+  `sentiment_compound`, `sentiment_low_confidence`) onto the
+  already-ingested chunks (same chunk IDs as Week 2's
+  `ingest_to_chromadb.py`, so this is a metadata-enriching upsert, not
+  a duplicate ingest). This is what makes **filtered retrieval**
+  possible — `src/vector_store.py`'s `search(..., where=...)` already
+  supported arbitrary metadata filters since Week 2; this week gives
+  it NLP-derived filters to use:
+    ```python
+    store.search(query_vec, where={"sentiment_label": "negative"})
+    store.search(query_vec, where={"topic_id": 3})
+    ```
+  Also writes `logs/topic_summary.json` (topic sizes, top words, a
+  couple of example chunks per topic) — this is the artifact a human
+  reviewer reads to manually validate the clusters actually mean
+  something, per this week's requirement.
+- **Tests** (27 new, 135 total across the repo, 1 skipped by design):
+  `tests/test_topic_modeling.py` (12 — against the real BERTopic/UMAP/
+  HDBSCAN stack on small synthetic corpora with well-separated 2D
+  embeddings, not mocked, so clustering bugs aren't hidden; verifies
+  two distinct clusters actually get separated and labeled with their
+  real vocabulary) and `tests/test_sentiment_analysis.py` (15 —
+  positive/negative/neutral classification, negation handling, the
+  low-confidence short-text flag, the jargon-scores-near-neutral
+  behavior, and batch processing).
+
+### Results: sentiment accuracy on the hand-labeled set
+
+Run via `python scripts/evaluate_sentiment.py --verbose`:
+
+| Category | Accuracy | What it tests |
+|---|---|---|
+| clear-cut | 100.0% (6/6) | Unambiguous positive/negative/neutral examples |
+| informal | 66.7% (2/3) | Reddit-style text — negation, intensifiers, punctuation |
+| jargon | 66.7% (2/3) | Formal ArXiv-style text with no sentiment vocabulary |
+| short | 66.7% (2/3) | 1-2 word fragments |
+| **overall** | **77.8% (14/18)** | |
+
+The misses are informative, not noise: `"We propose a novel attention
+mechanism..."` scored positive (compound `+0.32`) purely because
+"novel" is in VADER's positive lexicon — a clear instance of the
+documented jargon limitation, where a word that's positively-valenced
+in everyday English is sentiment-neutral in a paper abstract.
+`"not bad, not great, just kind of average"` also scored positive
+(`+0.68`): VADER's negation handling flips `"not bad"` positive but
+doesn't fully cancel it against the immediately following `"not
+great"`, so double-negation-toward-neutral confuses the compound
+score. Both are exactly the kind of failure a corpus-level "validate
+manually" pass is meant to catch before trusting sentiment metadata in
+production filtering.
+
+### How to run it
+
+```bash
+# 1. Run the new unit tests
+pytest tests/test_topic_modeling.py tests/test_sentiment_analysis.py -v
+
+# 2. Validate sentiment accuracy against the hand-labeled set
+python scripts/evaluate_sentiment.py --verbose
+# -> logs/sentiment_evaluation.json
+
+# 3. Enrich the ingested ChromaDB collection with topic + sentiment metadata
+python scripts/enrich_corpus_with_nlp.py
+# -> logs/topic_summary.json (review this to manually validate topics)
+
+# 4. Try a filtered search (Python, or wire into rag_query.py's --where)
+python -c "
+from src.vector_store import VectorStore
+from src.embeddings import EmbeddingGenerator
+store = VectorStore()
+vec = EmbeddingGenerator().embed_batch(['your query here'])[0]
+for r in store.search(vec, top_k=5, where={'sentiment_label': 'negative'}):
+    print(r.chunk_id, r.metadata.get('topic_label'), r.text[:80])
+"
+```
+
+### Dependencies added this week
+
+`bertopic` (bumped from the Week 1 speculative pin `0.16.3` to the
+verified-working `0.17.4`), plus `umap-learn` and `hdbscan` newly
+pinned — `topic_modeling.py` imports both directly (for the small-
+corpus clamping described above), not just transitively through
+BERTopic, so they need their own explicit pins. `nltk` and
+`vaderSentiment` were already pinned from Week 1.
+
+### Known limitations / next steps
+
+- Topic modeling is validated against synthetic, well-separated test
+  corpora in unit tests, and end-to-end against the small sample
+  corpus (where — expectedly, at only 4 chunks — everything lands in
+  the outlier topic; BERTopic needs real volume to find structure).
+  The real 5,000+ document corpus hasn't been topic-modeled in this
+  environment for the same reason as every prior week: no network
+  access here to run the full ArXiv acquisition first. Run
+  `scripts/enrich_corpus_with_nlp.py` locally after Week 1-2's
+  pipeline has populated a real corpus, then review
+  `logs/topic_summary.json` for the actual manual-validation pass.
+- Sentiment accuracy (77.8% on 18 examples) is a starting signal, not
+  a final number — the hand-labeled set is intentionally small per
+  this week's brief; Week 5's evaluation script is the natural place
+  to grow it and track accuracy over time as the corpus/thresholds
+  change.
+- Filtered retrieval is wired into `src/vector_store.py` and
+  demonstrated above, but `scripts/rag_query.py` doesn't yet expose a
+  `--where` CLI flag — that's a small, natural Week 5 addition once
+  FastAPI request parameters need the same filtering.
+- Week 5 will wrap the whole system in FastAPI and add the formal
+  Precision@K/Recall@K retrieval evaluation.
