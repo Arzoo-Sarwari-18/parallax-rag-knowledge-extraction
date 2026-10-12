@@ -1,0 +1,22 @@
+[
+  {
+    "query": "What is retrieval-augmented generation?",
+    "relevant_doc_ids": ["2401.00001"],
+    "note": "Should pull the RAG survey abstract."
+  },
+  {
+    "query": "How does topic modeling work on large text corpora?",
+    "relevant_doc_ids": ["2401.00002"],
+    "note": "Should pull the BERTopic-at-scale abstract."
+  },
+  {
+    "query": "sentiment analysis techniques for scientific writing",
+    "relevant_doc_ids": ["2401.00005"],
+    "note": "Should pull the scientific-discourse sentiment abstract."
+  },
+  {
+    "query": "vector database indexing and chunking strategies for embeddings",
+    "relevant_doc_ids": ["2401.00001", "2401.00002"],
+    "note": "Overlaps both RAG (chunking/retrieval) and topic modeling (embeddings) abstracts -- tests recall across multiple relevant docs for one query."
+  }
+]

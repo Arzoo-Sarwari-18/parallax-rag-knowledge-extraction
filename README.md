@@ -26,9 +26,11 @@ parallax-rag-system/
 │   ├── build_clean_corpus.py    # runs data/raw/*.jsonl through preprocessing.py
 │   ├── ingest_to_chromadb.py    # chunk -> embed -> ingest into ChromaDB
 │   ├── benchmark_retrieval.py   # measures retrieval latency across test queries
-│   ├── rag_query.py             # end-to-end: retrieve -> generate -> hallucination check
+│   ├── rag_query.py             # thin CLI wrapper around src/rag_pipeline.run_query
 │   ├── enrich_corpus_with_nlp.py # adds topic + sentiment metadata to ChromaDB chunks
-│   └── evaluate_sentiment.py    # accuracy check against a hand-labeled test set
+│   ├── evaluate_sentiment.py    # accuracy check against a hand-labeled test set
+│   ├── evaluate_retrieval.py    # Precision@K / Recall@K against a labeled test set
+│   └── evaluate_generation.py   # end-to-end generation quality + latency evaluation
 ├── src/
 │   ├── preprocessing.py        # modular text-cleaning functions
 │   ├── chunking.py             # recursive text chunking
@@ -37,7 +39,14 @@ parallax-rag-system/
 │   ├── generation.py           # LLM answer generation (OpenRouter/DeepSeek)
 │   ├── hallucination_check.py  # heuristic groundedness check on generated answers
 │   ├── topic_modeling.py       # BERTopic over precomputed chunk embeddings
-│   └── sentiment_analysis.py   # VADER-based sentiment scoring
+│   ├── sentiment_analysis.py   # VADER-based sentiment scoring
+│   ├── rag_pipeline.py         # the actual embed->retrieve->generate->check flow
+│   ├── retrieval_metrics.py    # Precision@K / Recall@K, pure functions
+│   ├── generation_metrics.py   # keyword coverage, latency percentiles, verdict tally
+│   └── api.py                  # FastAPI app: /health, /query, /query_log
+├── data/eval/
+│   ├── retrieval_test_set.json   # hand-labeled (query, relevant_doc_ids) pairs
+│   └── generation_test_set.json  # hand-labeled (question, expected_keywords) pairs
 ├── tests/
 │   ├── test_preprocessing.py
 │   ├── test_chunking.py
@@ -47,7 +56,10 @@ parallax-rag-system/
 │   ├── test_hallucination_check.py
 │   ├── test_rag_query.py
 │   ├── test_topic_modeling.py
-│   └── test_sentiment_analysis.py
+│   ├── test_sentiment_analysis.py
+│   ├── test_retrieval_metrics.py
+│   ├── test_generation_metrics.py
+│   └── test_api.py
 ├── .env.example
 ├── .gitignore
 ├── pytest.ini
@@ -632,5 +644,173 @@ BERTopic, so they need their own explicit pins. `nltk` and
   demonstrated above, but `scripts/rag_query.py` doesn't yet expose a
   `--where` CLI flag — that's a small, natural Week 5 addition once
   FastAPI request parameters need the same filtering.
-- Week 5 will wrap the whole system in FastAPI and add the formal
-  Precision@K/Recall@K retrieval evaluation.
+- Week 5 wraps the whole system in FastAPI and adds the formal
+  Precision@K/Recall@K retrieval evaluation — see below.
+
+---
+
+## Week 5 (Oct 12 – Oct 18): Evaluation & API (FastAPI)
+
+### What I built
+
+- **`src/rag_pipeline.py`**: the Week 3 `scripts/rag_query.py` logic
+  (embed → retrieve → filter out-of-domain → generate → hallucination
+  check → log) pulled out into `src/` so the CLI and the new FastAPI
+  app call the **identical code path** rather than the API
+  re-implementing the CLI's logic and risking the two silently
+  drifting apart over time. `scripts/rag_query.py` is now a thin
+  `argparse` wrapper around `run_query()`.
+- **`src/api.py`**: FastAPI app with three endpoints —
+  - `GET /health` — liveness + chunk count, deliberately makes **no
+    LLM call**, so a 200 means "the API and ChromaDB are reachable,"
+    not "a query will necessarily succeed."
+  - `POST /query` — the full pipeline, request/response validated by
+    Pydantic models (`question`, `top_k`, `max_distance`,
+    `collection`, `model` override).
+  - `GET /query_log` — tails the most recent entries from
+    `logs/query_log.jsonl` for quick inspection without opening the
+    file.
+  - **Error handling, three distinct codes**: `422` for schema-shape
+    problems (missing field, wrong type, `top_k` out of range) —
+    FastAPI's own default, left as-is since it's already a clear,
+    structured response; `400` for well-typed-but-semantically-invalid
+    requests (a whitespace-only question), raised as a plain
+    `ValueError` in the endpoint body and mapped to 400 by a
+    registered handler; `500` for `GenerationError` (auth/rate-limit/
+    timeout/context-length/upstream — see Week 3's
+    `GenerationErrorType`) and anything genuinely unexpected, always
+    returned as `{"error_type", "message", "request_id"}`, never a raw
+    traceback.
+  - **Structured request logging**: a middleware logs every request
+    (method, path, status, duration, request_id) to
+    `logs/api_requests.jsonl` — separate from `query_log.jsonl`'s
+    per-query RAG detail, since they answer different questions ("is
+    the API healthy/fast overall?" vs. "what did this specific query
+    retrieve and answer?"). Every response carries an `X-Request-ID`
+    header matching its log line, so a client-reported error can be
+    traced straight to the matching server log entry.
+  - **A real bug, caught by writing the tests, not assumed away**:
+    Starlette registers a handler for the generic `Exception` class on
+    `ServerErrorMiddleware`, which sits *outside* user-added middleware
+    like the request-logging one above (`Starlette.build_middleware_stack`
+    puts user middleware between `ServerErrorMiddleware` and
+    `ExceptionMiddleware`). That means an exception with no specific
+    handler propagates straight past the logging middleware's
+    `call_next()` *before* the registered `Exception` handler ever
+    runs — so relying on `@app.exception_handler(Exception)` alone
+    produces an unhandled error in some ASGI-server/test-client
+    situations instead of the intended clean 500. Fixed by wrapping
+    `call_next()` in its own `try/except` directly inside the logging
+    middleware, so every request gets a logged, well-formed JSON error
+    response regardless of this ordering quirk; the registered handler
+    stays in place as defense-in-depth for any code path outside the
+    middleware. `tests/test_api.py::test_unexpected_exception_returns_500_generic_body`
+    is what surfaced this.
+  - **A second real bug**: the original `QueryRequest` used a Pydantic
+    `@field_validator` to reject a whitespace-only question. A
+    validator's `ValueError` fires during request *parsing*, before
+    the endpoint body runs, so FastAPI always converts it to a `422`
+    — there's no way to make a field validator produce the intended
+    `400`. Fixed by moving that check into the endpoint body itself
+    (same place the `top_k` business-rule check already lived),
+    exactly matching the module docstring's description of the
+    400-vs-422 split. `test_blank_question_returns_400_not_422` caught
+    this one.
+- **`src/retrieval_metrics.py` + `scripts/evaluate_retrieval.py`**:
+  Precision@K/Recall@K computed at the **document** level (a chunk
+  counts as a hit if its source document is in the query's labeled
+  relevant set) rather than the chunk level — a human building a
+  labeled test set can reasonably judge "this query should pull
+  something from document X," but judging exact-chunk relevance
+  requires knowing the chunking scheme, which shouldn't leak into a
+  relevance label. `data/eval/retrieval_test_set.json` is a small
+  hand-labeled set keyed to the Week 1 sample corpus (one multi-
+  relevant-document query included, to actually exercise Recall
+  dropping below 1.0 when only some relevant docs are retrieved).
+- **`src/generation_metrics.py` + `scripts/evaluate_generation.py`**:
+  automated end-to-end quality + latency evaluation. "Quality" here is
+  a **keyword-coverage proxy** — does the generated answer mention the
+  terms a correct answer would have to — explicitly documented as a
+  proxy, not semantic ground truth: it catches "retrieval/generation
+  surfaced the wrong content" but not "a fluent answer used the right
+  keywords while getting the relationship between them wrong." Also
+  reports the hallucination-verdict distribution across the run,
+  out-of-domain detection accuracy (did the questions labeled
+  `expect_out_of_domain` actually get the `out_of_domain` verdict),
+  and latency as four separate distributions (embed/retrieval/
+  generation/total — each with mean/p50/p95/max) so a slow run can be
+  attributed to the right stage instead of one opaque total number.
+- **`tests/test_api.py`**: 19 tests against FastAPI's `TestClient`,
+  with `run_query` mocked at the `src.api` module level (so these test
+  the API layer's own responsibilities — validation, status-code
+  mapping, response shape, logging — not the pipeline internals
+  already covered elsewhere). Covers all three status codes, the
+  out-of-domain response shape, every `GenerationErrorType` mapping to
+  500, the "raw exception message never leaks to the client" guarantee,
+  the request-ID header, and the structured log file's contents.
+- **Tests overall** (49 new, 184 total across the repo, 1 skipped by
+  design): the above plus `tests/test_retrieval_metrics.py` (19 — pure
+  precision/recall math, including the duplicate-document and
+  vacuous-recall edge cases) and `tests/test_generation_metrics.py`
+  (11 — keyword coverage, latency percentiles, verdict tallying).
+
+### How to run it
+
+```bash
+# 1. Run the new unit tests
+pytest tests/test_api.py tests/test_retrieval_metrics.py tests/test_generation_metrics.py -v
+
+# 2. Make sure the vector DB is populated (Week 2) and .env has OPENROUTER_API_KEY (Week 3)
+python scripts/ingest_to_chromadb.py
+
+# 3. Run the retrieval evaluation (Precision@K / Recall@K)
+python scripts/evaluate_retrieval.py --k 5
+# -> logs/retrieval_evaluation.json
+
+# 4. Run the end-to-end generation evaluation (needs a live LLM call)
+python scripts/evaluate_generation.py
+# -> logs/generation_evaluation.json
+
+# 5. Start the API
+uvicorn src.api:app --reload --port 8000
+
+# 6. Try it
+curl http://localhost:8000/health
+curl -X POST http://localhost:8000/query \
+  -H "Content-Type: application/json" \
+  -d '{"question": "What is retrieval-augmented generation?", "top_k": 5}'
+curl "http://localhost:8000/query_log?limit=5"
+
+# Interactive API docs (FastAPI auto-generates these):
+# http://localhost:8000/docs
+```
+
+### Dependencies added this week
+
+None — `fastapi`, `uvicorn`, and `pydantic` were already pinned in
+`requirements.txt` from Week 1 in anticipation of this week, and
+`pytest-httpx` (Week 3) already covers HTTP mocking needs.
+
+### Known limitations / next steps
+
+- Both evaluation scripts are verified end-to-end in this environment
+  against the small sample corpus with a mocked embedding model and a
+  mocked LLM response (no network access here to the real embedding
+  model host or OpenRouter) — the scripts' *mechanics* are confirmed
+  correct (metrics compute correctly, reports write correctly, latency
+  is measured correctly), but the actual Precision@K/Recall@K/keyword-
+  coverage numbers need a real embedding model and a real 5,000+
+  document corpus to mean anything. Run both locally once Weeks 1-2's
+  pipeline has populated a real corpus and grow `data/eval/*.json`
+  well beyond today's small hand-labeled sets.
+- The out-of-domain detection accuracy metric depends on the LLM
+  reliably using the exact refusal phrase `generation.py`'s system
+  prompt asks for — robust in testing against a mocked LLM that
+  follows instructions exactly, but worth spot-checking against the
+  real model's actual behavior, since a real LLM won't always phrase
+  a refusal identically.
+- The API has no authentication — fine for local/internship-review use,
+  but worth flagging before any real deployment.
+- Week 6 finalizes documentation (docstrings/type hints throughout),
+  compiles every week's benchmarks into one place, and is the last
+  week before the mandatory exit survey.

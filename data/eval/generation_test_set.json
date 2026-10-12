@@ -1,0 +1,27 @@
+[
+  {
+    "question": "What is retrieval-augmented generation?",
+    "expected_keywords": ["retrieval", "generation"],
+    "expect_out_of_domain": false
+  },
+  {
+    "question": "How does BERTopic compare to LDA for topic modeling?",
+    "expected_keywords": ["BERTopic", "LDA"],
+    "expect_out_of_domain": false
+  },
+  {
+    "question": "What is sentiment analysis used for in scientific discourse?",
+    "expected_keywords": ["sentiment"],
+    "expect_out_of_domain": false
+  },
+  {
+    "question": "What's the best recipe for chocolate chip cookies?",
+    "expected_keywords": [],
+    "expect_out_of_domain": true
+  },
+  {
+    "question": "Who won the 2022 FIFA World Cup?",
+    "expected_keywords": [],
+    "expect_out_of_domain": true
+  }
+]
